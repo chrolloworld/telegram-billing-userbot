@@ -1,0 +1,18 @@
+{
+  "API_ID": "API_ID_TELEGRAM",
+  "API_HASH": "API_HASH_TELEGRAM",
+  "SESSION": "SESSION_TELEGRAM_TELETHON",
+  "PREFIX": ".",
+  "QRIS_FOLDER": "qris",
+  "BUSINESS_NAME": "AnonymHost",
+  "DELETE_COMMAND": "true",
+  "GRACE_DAYS": "2",
+  "TAGIHAN_FILE": "tagihan.json",
+  "CHECK_INTERVAL_SECONDS": "300",
+
+  "_comment_pterodactyl": "4 baris di bawah OPSIONAL, kosongkan/hapus kalau tidak pakai fitur auto-suspend",
+  "PTERO_PANEL_URL": "LINK_PANEL_PTERODACTYL",
+  "PTERO_API_KEY": "API_KEY_PTERODACTYL",
+  "SUSPEND_HOUR_WIB": "1",
+  "SUSPEND_WINDOW_MINUTES": "10"
+}
