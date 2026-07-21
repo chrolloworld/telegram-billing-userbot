@@ -33,14 +33,14 @@ GRACE_DAYS = int(cfg("GRACE_DAYS", "3"))  # berapa hari telat sebelum warning te
 TAGIHAN_FILE = cfg("TAGIHAN_FILE", "tagihan.json")
 CHECK_INTERVAL_SECONDS = int(cfg("CHECK_INTERVAL_SECONDS", "300"))  # cek tiap 5 menit (dipercepat utk presisi suspend)
 
-# ---- Integrasi Pterodactyl (opsional, buat auto-suspend) ----
+# ---- Integrasi Pterodactyl (opsional, buat auto-stop server telat bayar) ----
 PTERO_PANEL_URL = cfg("PTERO_PANEL_URL", "").rstrip("/")  # contoh: https://panel.anonymhost.com
-PTERO_API_KEY = cfg("PTERO_API_KEY", "")  # Application API Key dari Admin -> API
-SUSPEND_HOUR_WIB = int(cfg("SUSPEND_HOUR_WIB", "1"))  # jam WIB kapan cek suspend (default jam 1 pagi)
+PTERO_CLIENT_API_KEY = cfg("PTERO_CLIENT_API_KEY", "")  # Client API Key dari Account Settings -> API Credentials
+SUSPEND_HOUR_WIB = int(cfg("SUSPEND_HOUR_WIB", "1"))  # jam WIB kapan cek stop otomatis (default jam 1 pagi)
 SUSPEND_WINDOW_MINUTES = int(cfg("SUSPEND_WINDOW_MINUTES", "10"))  # toleransi window cek
 WIB = timezone(timedelta(hours=7))
 
-AUTO_SUSPEND_ENABLED = bool(PTERO_PANEL_URL and PTERO_API_KEY)
+AUTO_STOP_ENABLED = bool(PTERO_PANEL_URL and PTERO_CLIENT_API_KEY)
 
 if not API_ID or not API_HASH or not SESSION:
     raise SystemExit(
@@ -162,22 +162,23 @@ def resolve_entry(db: dict, chat_id, label: str):
     )
 
 
-# ==================== PTERODACTYL API ====================
+# ==================== PTERODACTYL API (Client API - power actions) ====================
 
-async def _ptero_request(method: str, path: str) -> tuple[bool, str]:
-    """Panggil Application API Pterodactyl. Return (sukses, pesan)."""
-    if not AUTO_SUSPEND_ENABLED:
-        return False, "Integrasi Pterodactyl belum dikonfigurasi (PTERO_PANEL_URL / PTERO_API_KEY kosong)."
+async def _ptero_power(server_identifier: str, signal: str) -> tuple[bool, str]:
+    """Kirim power signal (start/stop/restart/kill) lewat Client API. Return (sukses, pesan)."""
+    if not AUTO_STOP_ENABLED:
+        return False, "Integrasi Pterodactyl belum dikonfigurasi (PTERO_PANEL_URL / PTERO_CLIENT_API_KEY kosong)."
 
-    url = f"{PTERO_PANEL_URL}/api/application/servers/{path}"
+    url = f"{PTERO_PANEL_URL}/api/client/servers/{server_identifier}/power"
     headers = {
-        "Authorization": f"Bearer {PTERO_API_KEY}",
+        "Authorization": f"Bearer {PTERO_CLIENT_API_KEY}",
         "Accept": "Application/vnd.pterodactyl.v1+json",
         "Content-Type": "application/json",
     }
+    payload = {"signal": signal}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.request(method, url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status in (200, 202, 204):
                     return True, "OK"
                 body = await resp.text()
@@ -186,16 +187,24 @@ async def _ptero_request(method: str, path: str) -> tuple[bool, str]:
         return False, f"Error koneksi: {e}"
 
 
-async def suspend_server(server_id: int) -> tuple[bool, str]:
-    return await _ptero_request("POST", f"{server_id}/suspend")
+async def stop_server(server_identifier: str) -> tuple[bool, str]:
+    return await _ptero_power(server_identifier, "stop")
 
 
-async def unsuspend_server(server_id: int) -> tuple[bool, str]:
-    return await _ptero_request("POST", f"{server_id}/unsuspend")
+async def start_server(server_identifier: str) -> tuple[bool, str]:
+    """
+    Kirim 'kill' dulu sebelum 'start'. Ini buat jaga-jaga kalau server sempat macet di
+    state antara stop->offline (proses gak berhenti bersih), yang bikin tombol Start
+    terkunci sampai di-kill manual dulu di beberapa konfigurasi Wings. Kalau server
+    sudah bersih offline, kill di sini cuma no-op (aman, gak ada efek samping).
+    """
+    await _ptero_power(server_identifier, "kill")
+    await asyncio.sleep(2)
+    return await _ptero_power(server_identifier, "start")
 
 
 def is_in_suspend_window(now_wib: datetime) -> bool:
-    """True kalau waktu sekarang (WIB) berada dalam window jam suspend, mis. 01:00-01:10."""
+    """True kalau waktu sekarang (WIB) berada dalam window jam stop otomatis, mis. 01:00-01:10."""
     target_minutes = SUSPEND_HOUR_WIB * 60
     now_minutes = now_wib.hour * 60 + now_wib.minute
     return target_minutes <= now_minutes < (target_minutes + SUSPEND_WINDOW_MINUTES)
@@ -226,9 +235,9 @@ async def pay_handler(event):
     await client.send_file(event.chat_id, qris_file, caption=caption)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}add-tagihan\s+([\w\-]+)\s+(\d{{4}})\s+(\d+)(?:\s+(\d+))?$"))
+@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}add-tagihan\s+([\w\-]+)\s+(\d{{4}})\s+(\d+)(?:\s+([\w\-]+))?$"))
 async def add_tagihan_handler(event):
-    label, ddmm, nominal_str, server_id_str = event.pattern_match.groups()
+    label, ddmm, nominal_str, server_identifier = event.pattern_match.groups()
     day, month = int(ddmm[:2]), int(ddmm[2:])
     nominal = int(nominal_str)
 
@@ -251,12 +260,12 @@ async def add_tagihan_handler(event):
         "next_due": due.isoformat(),
         "last_reminded": None,
         "active": True,
-        "server_id": int(server_id_str) if server_id_str else None,
-        "suspended": False,
+        "server_identifier": server_identifier,
+        "stopped": False,
     }
     await save_db(db)
 
-    server_info = f"\n🖥️ Server ID: {server_id_str}" if server_id_str else f"\n🖥️ Server ID: (belum diset, pakai `{PREFIX}set-server {label} <id>`)"
+    server_info = f"\n🖥️ Server: `{server_identifier}`" if server_identifier else f"\n🖥️ Server: (belum diset, pakai `{PREFIX}set-server {label} <identifier>`)"
     action_note = "diperbarui" if is_update else "diset"
     await event.edit(
         f"✅ Tagihan **{label}** {action_note} untuk chat ini:\n"
@@ -267,10 +276,9 @@ async def add_tagihan_handler(event):
     )
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}set-server\s+(?:([\w\-]+)\s+)?(\d+)$"))
+@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}set-server\s+(?:([\w\-]+)\s+)?([\w\-]+)$"))
 async def set_server_handler(event):
-    label, server_id_str = event.pattern_match.groups()
-    server_id = int(server_id_str)
+    label, server_identifier = event.pattern_match.groups()
     chat_id = event.chat_id
 
     db = await load_db()
@@ -279,14 +287,14 @@ async def set_server_handler(event):
         await event.edit(err)
         return
 
-    entry["server_id"] = server_id
+    entry["server_identifier"] = server_identifier
     db[key] = entry
     await save_db(db)
-    await event.edit(f"✅ Server ID `{server_id}` disambungkan ke tagihan **{entry['label']}**.")
+    await event.edit(f"✅ Server `{server_identifier}` disambungkan ke tagihan **{entry['label']}**.")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}suspend(?:\s+([\w\-]+))?$"))
-async def manual_suspend_handler(event):
+@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}stop(?:\s+([\w\-]+))?$"))
+async def manual_stop_handler(event):
     label = event.pattern_match.group(1)
     chat_id = event.chat_id
     db = await load_db()
@@ -294,21 +302,21 @@ async def manual_suspend_handler(event):
     if err:
         await event.edit(err)
         return
-    if not entry.get("server_id"):
-        await event.edit(f"❌ Tagihan **{entry['label']}** belum punya Server ID. Pakai `{PREFIX}set-server {entry['label']} <id>` dulu.")
+    if not entry.get("server_identifier"):
+        await event.edit(f"❌ Tagihan **{entry['label']}** belum punya Server yang tersambung. Pakai `{PREFIX}set-server {entry['label']} <identifier>` dulu.")
         return
-    ok, msg = await suspend_server(entry["server_id"])
+    ok, msg = await stop_server(entry["server_identifier"])
     if ok:
-        entry["suspended"] = True
+        entry["stopped"] = True
         db[key] = entry
         await save_db(db)
-        await event.edit(f"🔒 Server ID `{entry['server_id']}` ({entry['label']}) berhasil di-suspend.")
+        await event.edit(f"⏹️ Server `{entry['server_identifier']}` ({entry['label']}) berhasil di-stop.")
     else:
-        await event.edit(f"❌ Gagal suspend: {msg}")
+        await event.edit(f"❌ Gagal stop: {msg}")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}unsuspend(?:\s+([\w\-]+))?$"))
-async def manual_unsuspend_handler(event):
+@client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}start(?:\s+([\w\-]+))?$"))
+async def manual_start_handler(event):
     label = event.pattern_match.group(1)
     chat_id = event.chat_id
     db = await load_db()
@@ -316,17 +324,17 @@ async def manual_unsuspend_handler(event):
     if err:
         await event.edit(err)
         return
-    if not entry.get("server_id"):
-        await event.edit(f"❌ Tagihan **{entry['label']}** belum punya Server ID. Pakai `{PREFIX}set-server {entry['label']} <id>` dulu.")
+    if not entry.get("server_identifier"):
+        await event.edit(f"❌ Tagihan **{entry['label']}** belum punya Server yang tersambung. Pakai `{PREFIX}set-server {entry['label']} <identifier>` dulu.")
         return
-    ok, msg = await unsuspend_server(entry["server_id"])
+    ok, msg = await start_server(entry["server_identifier"])
     if ok:
-        entry["suspended"] = False
+        entry["stopped"] = False
         db[key] = entry
         await save_db(db)
-        await event.edit(f"🔓 Server ID `{entry['server_id']}` ({entry['label']}) berhasil di-unsuspend.")
+        await event.edit(f"▶️ Server `{entry['server_identifier']}` ({entry['label']}) berhasil di-start.")
     else:
-        await event.edit(f"❌ Gagal unsuspend: {msg}")
+        await event.edit(f"❌ Gagal start: {msg}")
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=rf"^\{PREFIX}lunas(?:\s+([\w\-]+))?$"))
@@ -339,23 +347,23 @@ async def lunas_handler(event):
         await event.edit(err)
         return
 
-    unsuspend_note = ""
-    if entry.get("suspended") and entry.get("server_id"):
-        ok, msg = await unsuspend_server(entry["server_id"])
-        unsuspend_note = "\n🔓 Server otomatis di-unsuspend." if ok else f"\n⚠️ Gagal auto-unsuspend: {msg}"
+    start_note = ""
+    if entry.get("stopped") and entry.get("server_identifier"):
+        ok, msg = await start_server(entry["server_identifier"])
+        start_note = "\n▶️ Server otomatis di-start kembali." if ok else f"\n⚠️ Gagal auto-start: {msg}"
 
     new_due = add_one_month(date.fromisoformat(entry["next_due"]))
     entry["next_due"] = new_due.isoformat()
     entry["last_reminded"] = None
     entry["active"] = True
-    entry["suspended"] = False
+    entry["stopped"] = False
     db[key] = entry
     await save_db(db)
 
     await event.edit(
         f"✅ Tagihan **{entry['label']}** dicatat lunas.\n"
         f"📅 Tagihan berikutnya: {new_due.strftime('%d %B %Y')} ({format_rupiah(entry['nominal'])})"
-        f"{unsuspend_note}"
+        f"{start_note}"
     )
 
 
@@ -390,9 +398,9 @@ async def tagihan_sini_handler(event):
             status = f"⚠️ Telat {(today - due).days} hari"
         elif due == today:
             status = "🔔 Jatuh tempo hari ini"
-        server_note = f" | 🖥️ {e['server_id']}" if e.get("server_id") else ""
-        suspend_note = " | 🔒 suspended" if e.get("suspended") else ""
-        lines.append(f"• **{e['label']}** — {format_rupiah(e['nominal'])} — {due.strftime('%d %b %Y')} ({status}){server_note}{suspend_note}")
+        server_note = f" | 🖥️ {e['server_identifier']}" if e.get("server_identifier") else ""
+        stopped_note = " | ⏹️ stopped" if e.get("stopped") else ""
+        lines.append(f"• **{e['label']}** — {format_rupiah(e['nominal'])} — {due.strftime('%d %b %Y')} ({status}){server_note}{stopped_note}")
     await event.edit("\n".join(lines))
 
 
@@ -418,10 +426,10 @@ async def list_tagihan_handler(event):
             name = getattr(chat, "first_name", None) or getattr(chat, "title", None) or str(e["chat_id"])
         except Exception:
             name = str(e["chat_id"])
-        server_note = f" | 🖥️ {e['server_id']}" if e.get("server_id") else ""
-        suspend_note = " | 🔒 suspended" if e.get("suspended") else ""
+        server_note = f" | 🖥️ {e['server_identifier']}" if e.get("server_identifier") else ""
+        stopped_note = " | ⏹️ stopped" if e.get("stopped") else ""
         lines.append(
-            f"• **{name}** ({e['label']}) — {format_rupiah(e['nominal'])} — {due.strftime('%d %b %Y')} ({status}){server_note}{suspend_note}"
+            f"• **{name}** ({e['label']}) — {format_rupiah(e['nominal'])} — {due.strftime('%d %b %Y')} ({status}){server_note}{stopped_note}"
         )
     await event.edit("\n".join(lines))
 
@@ -436,18 +444,18 @@ async def help_handler(event):
     text = (
         f"**Userbot {BUSINESS_NAME} - Command List**\n\n"
         f"`{PREFIX}pay <nominal>` - kirim QRIS + tagihan\n"
-        f"`{PREFIX}add-tagihan <label> <DDMM> <nominal> [server_id]` - set/update tagihan bulanan "
-        f"(mis. `{PREFIX}add-tagihan webutama 0205 150000 3`). Satu chat bisa punya banyak "
+        f"`{PREFIX}add-tagihan <label> <DDMM> <nominal> [server_identifier]` - set/update tagihan bulanan "
+        f"(mis. `{PREFIX}add-tagihan webutama 0205 150000 d3aac351`). Satu chat bisa punya banyak "
         f"tagihan asal label beda.\n"
-        f"`{PREFIX}set-server [label] <server_id>` - sambungkan tagihan ke Server ID Pterodactyl\n"
-        f"`{PREFIX}lunas [label]` - tandai lunas, majukan ke bulan depan, auto-unsuspend kalau ke-suspend\n"
+        f"`{PREFIX}set-server [label] <server_identifier>` - sambungkan tagihan ke server Pterodactyl\n"
+        f"`{PREFIX}lunas [label]` - tandai lunas, majukan ke bulan depan, auto-start kalau server sempat di-stop\n"
         f"`{PREFIX}hapus-tagihan [label]` - hapus tagihan\n"
         f"`{PREFIX}tagihan-sini` - lihat semua tagihan di chat ini\n"
         f"`{PREFIX}list-tagihan` - lihat semua tagihan aktif di semua chat\n"
-        f"`{PREFIX}suspend [label]` / `{PREFIX}unsuspend [label]` - suspend/unsuspend manual\n"
+        f"`{PREFIX}stop [label]` / `{PREFIX}start [label]` - stop/start server manual\n"
         f"`{PREFIX}ping` - cek bot hidup\n\n"
         f"ℹ️ `[label]` boleh dikosongkan kalau chat cuma punya 1 tagihan.\n"
-        f"Auto-suspend: {'✅ aktif' if AUTO_SUSPEND_ENABLED else '❌ nonaktif (isi PTERO_PANEL_URL & PTERO_API_KEY)'}"
+        f"Auto-stop: {'✅ aktif' if AUTO_STOP_ENABLED else '❌ nonaktif (isi PTERO_PANEL_URL & PTERO_CLIENT_API_KEY)'}"
     )
     await event.edit(text)
 
@@ -491,30 +499,30 @@ async def reminder_loop():
                 elif due < today:
                     days_late = (today - due).days
 
-                    # ---- Auto-suspend: cek kalau sudah masuk window jam suspend WIB ----
+                    # ---- Auto-stop: cek kalau sudah masuk window jam stop WIB ----
                     if (
-                        AUTO_SUSPEND_ENABLED
-                        and entry.get("server_id")
-                        and not entry.get("suspended", False)
+                        AUTO_STOP_ENABLED
+                        and entry.get("server_identifier")
+                        and not entry.get("stopped", False)
                         and is_in_suspend_window(now_wib)
                     ):
-                        ok, msg = await suspend_server(entry["server_id"])
+                        ok, msg = await stop_server(entry["server_identifier"])
                         if ok:
-                            entry["suspended"] = True
+                            entry["stopped"] = True
                             changed = True
                             await client.send_message(
                                 entry["chat_id"],
-                                f"🔒 **Layanan Dinonaktifkan Sementara ({label})**\n\n"
+                                f"⏹️ **Layanan Dinonaktifkan Sementara ({label})**\n\n"
                                 f"Tagihan sebesar {format_rupiah(entry['nominal'])} belum dibayar "
-                                f"hingga jatuh tempo. Server telah di-suspend otomatis.\n"
+                                f"hingga jatuh tempo. Server telah di-stop otomatis.\n"
                                 f"Silahkan lakukan pembayaran, layanan akan aktif kembali begitu "
                                 f"dikonfirmasi lunas 🙏",
                             )
                         else:
-                            print(f"[reminder_loop] gagal auto-suspend {key}: {msg}")
+                            print(f"[reminder_loop] gagal auto-stop {key}: {msg}")
 
                     if last_reminded == today_str:
-                        continue  # sudah diingatkan hari ini (tapi suspend check tetap jalan di atas)
+                        continue  # sudah diingatkan hari ini (tapi stop check tetap jalan di atas)
 
                     if days_late >= GRACE_DAYS:
                         text = (
