@@ -1,6 +1,6 @@
 # Pterodactyl Billing Userbot
 
-**Sistem billing Telegram otomatis untuk reseller hosting.** Kirim kode pembayaran QRIS, kirim pengingat bulanan, dan auto-suspend server Pterodactyl untuk pelanggan yang belum bayar — semuanya lewat akun Telegram kamu sendiri.
+**Sistem billing Telegram otomatis untuk reseller hosting.** Kirim kode pembayaran QRIS, kirim pengingat bulanan, dan auto-stop server Pterodactyl untuk pelanggan yang belum bayar — semuanya lewat akun Telegram kamu sendiri.
 
 Dibangun pakai [Telethon](https://github.com/LonamiWebs/Telethon) sebagai userbot (jalan di akun Telegram pribadi kamu, bukan bot BotFather), dirancang khusus untuk reseller hosting/server berbasis Pterodactyl yang selama ini nge-manage billing pelanggan secara manual.
 
@@ -27,7 +27,7 @@ Reminder harian berlanjut, makin tegas setelah masa tenggang habis
 Masih belum bayar sampai jam 01:00 WIB sehari setelah jatuh tempo?
         │
         ▼
-   Bot otomatis suspend server pelanggan lewat Pterodactyl API
+   Bot otomatis stop server pelanggan lewat Pterodactyl Client API
 ```
 
 ## Fitur
@@ -36,7 +36,7 @@ Masih belum bayar sampai jam 01:00 WIB sehari setelah jatuh tempo?
 - **Reminder bulanan berulang** — set tanggal jatuh tempo sekali, bot otomatis ingatkan pelanggan tiap bulan tanpa perlu dicatat manual.
 - **Banyak tagihan dalam 1 chat** — satu pelanggan bisa punya beberapa item tagihan terpisah (misal hosting + domain), masing-masing dilacak sendiri lewat label.
 - **Pesan telat bayar yang makin tegas** — masa tenggang bisa diatur sebelum nada pesan berubah jadi lebih serius.
-- **Auto-suspend di Pterodactyl** — sambungkan tagihan ke Server ID pelanggan; kalau belum bayar + sudah lewat jatuh tempo + masuk jam suspend → server otomatis di-suspend lewat Pterodactyl Application API. Begitu bayar, otomatis di-unsuspend lagi.
+- **Auto-stop di Pterodactyl** — sambungkan tagihan ke identifier server pelanggan; kalau belum bayar + sudah lewat jatuh tempo + masuk jam stop → server otomatis di-stop lewat Pterodactyl Client API. Begitu bayar, otomatis di-start lagi.
 - **Self-hosted, data tetap punya kamu** — tanpa SaaS billing pihak ketiga, cukup panel Pterodactyl dan akun Telegram kamu sendiri.
 
 ## Daftar Command
@@ -45,13 +45,13 @@ Masih belum bayar sampai jam 01:00 WIB sehari setelah jatuh tempo?
 |---|---|
 | `.pay <nominal>` | Kirim gambar QRIS tersimpan + caption tagihan |
 | `.pay` | Kirim QRIS tanpa nominal spesifik |
-| `.add-tagihan <label> <DDMM> <nominal> [server_id]` | Buat/update tagihan berulang. Contoh: `.add-tagihan web 0205 150000 3` |
-| `.set-server [label] <server_id>` | Sambungkan Server ID Pterodactyl ke tagihan belakangan |
-| `.lunas [label]` | Tandai tagihan lunas — jatuh tempo maju ke bulan depan, auto-unsuspend kalau sempat ke-suspend |
+| `.add-tagihan <label> <DDMM> <nominal> [server_identifier]` | Buat/update tagihan berulang. Contoh: `.add-tagihan web 0205 150000 d3aac351` |
+| `.set-server [label] <server_identifier>` | Sambungkan server Pterodactyl ke tagihan belakangan |
+| `.lunas [label]` | Tandai tagihan lunas — jatuh tempo maju ke bulan depan, auto-start kalau server sempat di-stop |
 | `.hapus-tagihan [label]` | Hapus satu tagihan |
 | `.tagihan-sini` | Lihat semua tagihan di chat ini |
 | `.list-tagihan` | Lihat semua tagihan di semua chat |
-| `.suspend [label]` / `.unsuspend [label]` | Suspend/unsuspend manual server yang tersambung |
+| `.stop [label]` / `.start [label]` | Stop/start manual server yang tersambung |
 | `.ping` | Cek bot masih hidup |
 | `.help` | Tampilkan daftar command |
 
@@ -61,7 +61,7 @@ Masih belum bayar sampai jam 01:00 WIB sehari setelah jatuh tempo?
 
 - Akun Telegram (dipakai untuk menjalankan userbot — command cuma bisa dipanggil dari akun ini)
 - Kredensial API dari [my.telegram.org](https://my.telegram.org)
-- Panel Pterodactyl (cuma dibutuhkan kalau mau pakai auto-suspend; fitur billing/reminder tetap jalan tanpa ini)
+- Panel Pterodactyl (cuma dibutuhkan kalau mau pakai auto-stop; fitur billing/reminder tetap jalan tanpa ini)
 - Python 3.11, atau server Pterodactyl dengan egg image `Python 3.11`
 
 ## Mulai Cepat
@@ -114,23 +114,23 @@ Setelah bot jalan, kirim `.ping` dari akun Telegram kamu sendiri di chat manapun
 | `GRACE_DAYS` | `3` | Berapa hari telat sebelum nada pesan makin tegas |
 | `TAGIHAN_FILE` | `tagihan.json` | Tempat data tagihan disimpan |
 | `CHECK_INTERVAL_SECONDS` | `300` | Seberapa sering loop background cek tagihan |
-| `PTERO_PANEL_URL` | *(kosong)* | URL panel Pterodactyl kamu — kosongkan untuk nonaktifkan auto-suspend |
-| `PTERO_API_KEY` | *(kosong)* | Pterodactyl **Application** API key (bukan Client API) |
-| `SUSPEND_HOUR_WIB` | `1` | Jam (WIB, 0–23) pengecekan auto-suspend dijalankan |
-| `SUSPEND_WINDOW_MINUTES` | `10` | Toleransi window di sekitar jam suspend |
+| `PTERO_PANEL_URL` | *(kosong)* | URL panel Pterodactyl kamu — kosongkan untuk nonaktifkan auto-stop |
+| `PTERO_CLIENT_API_KEY` | *(kosong)* | Pterodactyl **Client** API key (bukan Application API), dari Account Settings kamu sendiri |
+| `SUSPEND_HOUR_WIB` | `1` | Jam (WIB, 0–23) pengecekan auto-stop dijalankan |
+| `SUSPEND_WINDOW_MINUTES` | `10` | Toleransi window di sekitar jam stop |
 
 Panduan lengkap integrasi Pterodactyl (bikin API key, cari Server ID, permission yang dibutuhkan) ada di [`docs/PTERODACTYL-INTEGRATION.md`](./docs/PTERODACTYL-INTEGRATION.md).
 
 ## Catatan Keamanan
 
 - **`SESSION` dan `PTERO_API_KEY` setara dengan password.** Jangan pernah di-commit, jangan pernah dishare. Keduanya sudah otomatis dikecualikan lewat `.gitignore` (sebagai bagian dari `config.json`).
-- `PTERO_API_KEY` Pterodactyl harus berupa **Application API key** dengan permission seminimal mungkin (Servers: Read & Write) — ini beda dengan Client API key.
+- `PTERO_CLIENT_API_KEY` dibuat dari akun kamu sendiri (Account Settings, bukan Admin), dan hanya bisa mengontrol server yang dimiliki akun itu. Cocok untuk setup di mana semua server pelanggan dibuat di 1 akun admin/kamu sendiri.
 - Ini adalah userbot, bukan bot Telegram resmi — command dijalankan dari akun kamu sendiri. ToS Telegram secara resmi tidak mengizinkan automasi di akun user biasa, jadi gunakan secara wajar (tool ini dirancang untuk chat billing 1:1 dengan pelanggan, bukan untuk mass messaging).
 - QRIS yang dipakai di sini bersifat **statis** — nominal ditulis di caption pesan, bukan ter-embed ke dalam kode QR-nya. QRIS dinamis (nominal ter-embed di kode) membutuhkan integrasi payment gateway berbayar terpisah.
 
 ## Disclaimer
 
-Project ini mengotomatisasi penonaktifan infrastruktur milik pelanggan yang membayar. Coba dulu di server percobaan/staging sebelum diarahkan ke server pelanggan asli, dan pastikan pelanggan kamu sudah paham soal ketentuan pembayaran dan kebijakan suspend yang berlaku.
+Project ini mengotomatisasi penonaktifan infrastruktur milik pelanggan yang membayar. Coba dulu di server percobaan/staging sebelum diarahkan ke server pelanggan asli, dan pastikan pelanggan kamu sudah paham soal ketentuan pembayaran dan kebijakan stop otomatis yang berlaku.
 
 ## Lisensi
 
